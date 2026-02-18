@@ -49,7 +49,7 @@ type Play struct {
 	URI     string `gorm:"primaryKey"`
 	UserDid string
 
-	User	 User   `gorm:"foreignKey:UserDid"`
+	User User `gorm:"foreignKey:UserDid"`
 
 	Artists                []Artist `gorm:"many2many:play_artists;"`
 	Duration               int
@@ -108,12 +108,12 @@ func (s *Store) ListRecentPlays(limit int) ([]*Play, error) {
 	return plays, err
 }
 
-func (s *Store) SavePlaysBatch(db *gorm.DB, plays []Play) error {
+func (s *Store) SavePlaysBatch(db *gorm.DB, plays []*Play) error {
 	// cache artists to prevent querying for name/mbid combo
 	artistCache := make(map[string]Artist)
 
 	for i := range plays {
-		play := &plays[i]
+		play := plays[i]
 		for j := range play.Artists {
 			artist := &play.Artists[j]
 			cacheKey := artist.Name + "|" + artist.MBID

@@ -48,7 +48,8 @@ func (p playItem) Title() string {
 	return fmt.Sprintf("%s - %s", p.play.TrackName, artists.String())
 }
 func (p playItem) Description() string {
-	return fmt.Sprintf("@%s at %s", p.play.User.Handle, p.play.PlayedTime.Format("2006-01-02 15:04:05"))
+	localtime := p.play.PlayedTime.Local()
+	return fmt.Sprintf("@%s at %s", p.play.User.Handle, localtime.Format("2006-01-02 15:04:05"))
 }
 func (p playItem) FilterValue() string { return p.play.UserDid }
 

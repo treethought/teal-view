@@ -168,7 +168,7 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		return err
 	}
 
-	tx := c.store.DB.Begin()
+	plays := make([]*db.Play, 0, len(ops))
 	for _, op := range ops {
 		lf := log.Fields{
 			"did":    evt.Repo,
@@ -185,7 +185,6 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		col, rkey, err := syntax.ParseRepoPath(op.Path)
 		if err != nil {
 			c.log.WithError(err).WithFields(lf).Error("failed to parse repo path in commit event")
-			tx.Rollback()
 			return err
 		}
 		if col.String() != collection {
@@ -195,25 +194,30 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		recBytes, _, err := rr.GetRecordBytes(ctx, col, rkey)
 		if err != nil {
 			c.log.WithError(err).WithFields(lf).WithField("col", col.String()).WithField("rkey", rkey.String()).Error("failed to get record bytes from repo for commit event")
-			tx.Rollback()
 			return err
 		}
 
 		var play db.Play
 		if err := unmarshalJson(recBytes, &play); err != nil {
 			c.log.WithError(err).WithFields(lf).Error("failed to unmarshal commit event record bytes")
-			tx.Rollback()
 			return err
 		}
 		play.URI = fmt.Sprintf("at://%s/%s/%s", evt.Repo, col, rkey)
 		play.UserDid = evt.Repo
+		plays = append(plays, &play)
 
-		if err := c.store.SavePlay(tx, &play); err != nil {
-			c.log.WithError(err).WithFields(lf).Error("failed to save play record to database")
-			tx.Rollback()
-			return err
-		}
-		c.log.WithFields(lf).Debug("processed play record ")
+		c.log.WithFields(lf).Debug("processed play record")
+	}
+
+	tx := c.store.DB.Begin()
+	if err := c.store.SavePlaysBatch(tx, plays); err != nil {
+		c.log.WithError(err).WithFields(log.Fields{
+			"did":   evt.Repo,
+			"rev":   evt.Rev,
+			"count": len(plays),
+		}).Error("failed to save play records to db")
+		tx.Rollback()
+		return err
 	}
 
 	id, err := c.client.ResolveIdentity(evt.Repo)
@@ -231,7 +235,14 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		c.log.WithError(err).WithField("did", evt.Repo).Error("failed to update user in database")
 		return err
 	}
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		c.log.WithError(err).WithField("did", evt.Repo).Error("failed to commit transaction")
+		return err
+	}
+	for _, play := range plays {
+		c.PublishPlay(play)
+	}
+	return nil
 }
 
 func unmarshalJson(cborBytes []byte, out any) error {
@@ -274,7 +285,7 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		return err
 	}
 
-	plays := []db.Play{}
+	plays := []*db.Play{}
 	err = r.MST.Walk(func(key []byte, val cid.Cid) error {
 		col, rkey, err := syntax.ParseRepoPath(string(key))
 		if err != nil {
@@ -307,7 +318,7 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		}
 		play.URI = fmt.Sprintf("at://%s/%s/%s", did, col, rkey)
 		play.UserDid = did
-		plays = append(plays, play)
+		plays = append(plays, &play)
 		return nil
 	})
 	if err != nil {
