@@ -38,16 +38,16 @@ type User struct {
 }
 
 type Artist struct {
-	ID   uint    `gorm:"primaryKey"`
-	MBID *string `json:"artistMbId,omitempty" gorm:"unique"`
-	Name string  `json:"artistName"`
+	ID   uint   `gorm:"primaryKey"`
+	MBID string `json:"artistMbId,omitempty"`
+	Name string `json:"artistName"`
 }
 
 type Play struct {
-	URI     string `gorm:"gormPrimaryKey"`
+	URI     string `gorm:"primaryKey"`
 	UserDid string
 
-	Artists                []Artist `gorm:"serializer:json"`
+	Artists                []Artist `gorm:"many2many:play_artists;"`
 	Duration               int
 	OriginUrl              string
 	TrackName              string
@@ -77,18 +77,65 @@ func NewDB() (*gorm.DB, error) {
 
 type Store struct {
 	DB *gorm.DB
+
+	artistCache map[string]Artist
 }
 
 func NewStore(db *gorm.DB) *Store {
-	return &Store{DB: db}
+	return &Store{DB: db, artistCache: make(map[string]Artist)}
 }
 
 func (s *Store) Begin() *gorm.DB {
 	return s.DB.Begin()
 }
 
+func (s *Store) SavePlaysBatch(db *gorm.DB, plays []Play) error {
+	// cache artists to prevent querying for name/mbid combo
+	artistCache := make(map[string]Artist)
+
+	for i := range plays {
+		play := &plays[i]
+		for j := range play.Artists {
+			artist := &play.Artists[j]
+			cacheKey := artist.Name + "|" + artist.MBID
+			cached, ok := artistCache[cacheKey]
+			if ok {
+				play.Artists[j] = cached
+				continue
+			}
+			var existing Artist
+			err := db.Where("name = ? AND mb_id IS ?", artist.Name, artist.MBID).
+				FirstOrCreate(&existing, artist).Error
+			if err != nil {
+				return err
+			}
+			play.Artists[j] = existing
+			artistCache[cacheKey] = existing
+		}
+	}
+
+	return db.Clauses(clause.OnConflict{
+		UpdateAll: true,
+	}).CreateInBatches(plays, 100).Error
+}
+
 func (s *Store) SavePlay(db *gorm.DB, play *Play) error {
-	return db.Model(&Play{}).Create(play).Error
+	for i := range play.Artists {
+		artist := &play.Artists[i]
+		var existing Artist
+		err := db.Where("name = ? AND mb_id IS ?", artist.Name, artist.MBID).
+			FirstOrCreate(&existing, artist).Error
+		if err != nil {
+			return err
+		}
+		play.Artists[i] = existing
+	}
+
+	// save play with associated artists
+	return db.Clauses(clause.OnConflict{
+		UpdateAll: true,
+	}).Create(play).Error
+
 }
 
 func (s *Store) GetUserRev(did string) (string, error) {
