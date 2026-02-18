@@ -240,6 +240,7 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		return err
 	}
 	for _, play := range plays {
+		play.User = *user
 		c.PublishPlay(play)
 	}
 	return nil
@@ -308,6 +309,11 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		}
 		recBytes, _, err := r.GetRecordBytes(ctx, col, rkey)
 		if err != nil {
+			if lastRev != "" && strings.Contains(err.Error(), "could not find") {
+				// CAR is delta from lastRev, so missing records expected and
+				// should have already been processed
+				return nil
+			}
 			c.log.WithError(err).WithFields(lf).Error("failed to get record bytes")
 			return err
 		}
