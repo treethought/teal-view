@@ -1,4 +1,4 @@
-package main
+package at
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"github.com/treethought/teal-view/db"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/atproto/atclient"
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/repo"
@@ -27,56 +26,11 @@ import (
 
 var relayHost = "relay1.us-east.bsky.network"
 var pdsService = "https://bsky.social"
-var userAgent = "teal-view/0.1"
 
 var collection = "fm.teal.alpha.feed.play"
 
-type ATClient struct {
-	*atclient.APIClient
-	dir identity.Directory
-}
-
-func NewATClient(dir identity.Directory) *ATClient {
-	baseDir := &identity.BaseDirectory{}
-	cacheDir := identity.NewCacheDirectory(baseDir, 1000, 10*time.Minute, 10*time.Minute, 10*time.Minute)
-
-	client := atclient.NewAPIClient(pdsService)
-	client.Headers.Set("User-Agent", userAgent)
-
-	return &ATClient{
-		dir:       cacheDir,
-		APIClient: client,
-	}
-}
-
-func (c *ATClient) resolveIdentity(raw string) (*identity.Identity, error) {
-	id, err := syntax.ParseAtIdentifier(raw)
-	if err != nil {
-		return nil, err
-	}
-	idd, err := c.dir.Lookup(context.Background(), id)
-	if err != nil {
-		log.WithError(err).WithField("id", id.String()).Error("failed to resolve identity")
-		return nil, err
-	}
-	return idd, nil
-}
-
-func (c *ATClient) WithPDS(host string) *ATClient {
-	out := atclient.APIClient{
-		Client:     c.Client,
-		Host:       host,
-		Auth:       c.Auth,
-		Headers:    c.Headers.Clone(),
-		AccountDID: c.AccountDID,
-	}
-	return &ATClient{
-		dir:       c.dir,
-		APIClient: &out,
-	}
-}
-
 type Consumer struct {
+	log         *log.Entry
 	trackedDids map[string]struct{}
 	rsc         *events.RepoStreamCallbacks
 	store       *db.Store
@@ -86,23 +40,21 @@ type Consumer struct {
 	client      *ATClient
 	dir         identity.Directory
 	revs        map[string]string
-	ctx         context.Context
-	cancel      context.CancelFunc
+	playSubs    map[string]chan *db.Play
 }
 
 func NewConsumer(store *db.Store) *Consumer {
 	baseDir := &identity.BaseDirectory{}
 	cacheDir := identity.NewCacheDirectory(baseDir, 1000, 10*time.Minute, 10*time.Minute, 10*time.Minute)
 
-	client := atclient.NewAPIClient(pdsService)
-	client.Headers.Set("User-Agent", userAgent)
-
 	c := &Consumer{
+		log:         log.WithField("module", "consumer"),
 		trackedDids: make(map[string]struct{}),
 		store:       store,
 		client:      NewATClient(cacheDir),
 		dir:         cacheDir,
 		revs:        make(map[string]string),
+		playSubs:    make(map[string]chan *db.Play),
 	}
 	c.rsc = &events.RepoStreamCallbacks{
 		RepoCommit: c.handleCommitEvent,
@@ -111,8 +63,29 @@ func NewConsumer(store *db.Store) *Consumer {
 	return c
 }
 
+func (c *Consumer) SubPlays(did string) <-chan *db.Play {
+	ch := make(chan *db.Play, 100)
+	c.playSubs[did] = ch
+	return ch
+}
+
+func (c *Consumer) UnsubPlays(did string) {
+	if sub, ok := c.playSubs[did]; ok {
+		close(sub)
+		delete(c.playSubs, did)
+	}
+}
+
+func (c *Consumer) PublishPlay(play *db.Play) {
+	if sub, ok := c.playSubs[play.UserDid]; ok {
+		sub <- play
+	}
+	if sub, ok := c.playSubs["*"]; ok {
+		sub <- play
+	}
+}
+
 func (c *Consumer) Start(ctx context.Context) error {
-	c.ctx, c.cancel = context.WithCancel(ctx)
 	u := fmt.Sprintf("wss://%s/xrpc/com.atproto.sync.subscribeRepos", relayHost)
 
 	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
@@ -130,7 +103,7 @@ func (c *Consumer) TrackDid(did string) {
 
 func (c *Consumer) handleCommitEvent(evt *comatproto.SyncSubscribeRepos_Commit) error {
 	if err := c.processEvent(context.Background(), evt); err != nil {
-		log.WithError(err).WithFields(log.Fields{
+		c.log.WithError(err).WithFields(log.Fields{
 			"did": evt.Repo,
 			"rev": evt.Rev,
 		}).Error("failed to process commit event")
@@ -159,7 +132,7 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 
 	commit, _, err := repo.LoadRepoFromCAR(ctx, bytes.NewReader(evt.Blocks))
 	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
+		c.log.WithError(err).WithFields(log.Fields{
 			"did": evt.Repo,
 			"rev": evt.Rev,
 		}).Error("failed to load repo from CAR in commit event")
@@ -168,27 +141,27 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 
 	lastRev, err := c.store.GetUserRev(evt.Repo)
 	if err != nil && err != gorm.ErrRecordNotFound {
-		log.WithError(err).WithField("did", evt.Repo).Error("failed to get user rev from database")
+		c.log.WithError(err).WithField("did", evt.Repo).Error("failed to get user rev from database")
 		return err
 	}
 
 	if lastRev != commit.Rev {
 		if err := c.backfillUser(ctx, evt.Repo, lastRev); err != nil {
-			log.WithError(err).WithFields(log.Fields{
+			c.log.WithError(err).WithFields(log.Fields{
 				"did":      evt.Repo,
 				"sinceRev": lastRev,
 			}).Error("failed to backfill user from lastRev")
 			return err
 		}
 	}
-	log.WithFields(log.Fields{
+	c.log.WithFields(log.Fields{
 		"did": evt.Repo,
 		"rev": commit.Rev,
 	}).Info("processing commit event")
 
 	rr, err := repo.VerifyCommitMessage(ctx, evt)
 	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
+		c.log.WithError(err).WithFields(log.Fields{
 			"did": evt.Repo,
 			"rev": evt.Rev,
 		}).Error("failed to verify commit message")
@@ -205,13 +178,13 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		}
 
 		if op.Cid == nil {
-			log.WithFields(lf).Warn("Op has no CID, skipping")
+			c.log.WithFields(lf).Warn("Op has no CID, skipping")
 			continue
 		}
 
 		col, rkey, err := syntax.ParseRepoPath(op.Path)
 		if err != nil {
-			log.WithError(err).WithFields(lf).Error("failed to parse repo path in commit event")
+			c.log.WithError(err).WithFields(lf).Error("failed to parse repo path in commit event")
 			tx.Rollback()
 			return err
 		}
@@ -221,14 +194,14 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 
 		recBytes, _, err := rr.GetRecordBytes(ctx, col, rkey)
 		if err != nil {
-			log.WithError(err).WithFields(lf).WithField("col", col.String()).WithField("rkey", rkey.String()).Error("failed to get record bytes from repo for commit event")
+			c.log.WithError(err).WithFields(lf).WithField("col", col.String()).WithField("rkey", rkey.String()).Error("failed to get record bytes from repo for commit event")
 			tx.Rollback()
 			return err
 		}
 
 		var play db.Play
 		if err := unmarshalJson(recBytes, &play); err != nil {
-			log.WithError(err).WithFields(lf).Error("failed to unmarshal commit event record bytes")
+			c.log.WithError(err).WithFields(lf).Error("failed to unmarshal commit event record bytes")
 			tx.Rollback()
 			return err
 		}
@@ -236,16 +209,16 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		play.UserDid = evt.Repo
 
 		if err := c.store.SavePlay(tx, &play); err != nil {
-			log.WithError(err).WithFields(lf).Error("failed to save play record to database")
+			c.log.WithError(err).WithFields(lf).Error("failed to save play record to database")
 			tx.Rollback()
 			return err
 		}
-		log.WithFields(lf).Debug("processed play record ")
+		c.log.WithFields(lf).Debug("processed play record ")
 	}
 
-	id, err := c.client.resolveIdentity(evt.Repo)
+	id, err := c.client.ResolveIdentity(evt.Repo)
 	if err != nil {
-		log.WithError(err).WithField("did", evt.Repo).Error("failed to resolve identity for user")
+		c.log.WithError(err).WithField("did", evt.Repo).Error("failed to resolve identity for user")
 		return err
 	}
 
@@ -255,7 +228,7 @@ func (c *Consumer) processEvent(ctx context.Context, evt *comatproto.SyncSubscri
 		Rev:    commit.Rev,
 	}
 	if err := c.store.UpdateUser(tx, user); err != nil {
-		log.WithError(err).WithField("did", evt.Repo).Error("failed to update user in database")
+		c.log.WithError(err).WithField("did", evt.Repo).Error("failed to update user in database")
 		return err
 	}
 	return tx.Commit().Error
@@ -282,9 +255,9 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		"lastRev": lastRev,
 		"job":     "backfill",
 	}
-	log.WithFields(lf).Info("backfilling user")
+	c.log.WithFields(lf).Info("backfilling user")
 
-	id, err := c.client.resolveIdentity(did)
+	id, err := c.client.ResolveIdentity(did)
 	if err != nil {
 		return err
 	}
@@ -292,12 +265,12 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 
 	resp, err := comatproto.SyncGetRepo(ctx, client, did, lastRev)
 	if err != nil {
-		log.WithError(err).WithFields(lf).Error("failed to get repo for user")
+		c.log.WithError(err).WithFields(lf).Error("failed to get repo for user")
 		return err
 	}
 	commit, r, err := repo.LoadRepoFromCAR(ctx, bytes.NewReader(resp))
 	if err != nil {
-		log.WithError(err).WithFields(lf).Error("failed to load repo from CAR for user")
+		c.log.WithError(err).WithFields(lf).Error("failed to load repo from CAR for user")
 		return err
 	}
 
@@ -305,7 +278,7 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 	err = r.MST.Walk(func(key []byte, val cid.Cid) error {
 		col, rkey, err := syntax.ParseRepoPath(string(key))
 		if err != nil {
-			log.WithError(err).WithFields(log.Fields{
+			c.log.WithError(err).WithFields(log.Fields{
 				"key": string(key),
 			}).Error("failed to parse repo path")
 			return err
@@ -324,12 +297,12 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		}
 		recBytes, _, err := r.GetRecordBytes(ctx, col, rkey)
 		if err != nil {
-			log.WithError(err).WithFields(lf).Error("failed to get record bytes")
+			c.log.WithError(err).WithFields(lf).Error("failed to get record bytes")
 			return err
 		}
 		var play db.Play
 		if err := unmarshalJson(recBytes, &play); err != nil {
-			log.WithError(err).WithFields(lf).Error("failed to inmarshal record into model struct")
+			c.log.WithError(err).WithFields(lf).Error("failed to inmarshal record into model struct")
 			return err
 		}
 		play.URI = fmt.Sprintf("at://%s/%s/%s", did, col, rkey)
@@ -338,13 +311,13 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		return nil
 	})
 	if err != nil {
-		log.WithError(err).WithFields(lf).Error("failed to walk repo MST")
+		c.log.WithError(err).WithFields(lf).Error("failed to walk repo MST")
 		return err
 	}
 
 	tx := c.store.DB.Begin()
 	if err := c.store.SavePlaysBatch(tx, plays); err != nil {
-		log.WithError(err).WithFields(lf).Error("failed to save play record to database")
+		c.log.WithError(err).WithFields(lf).Error("failed to save play record to database")
 		tx.Rollback()
 		return err
 	}
@@ -355,15 +328,15 @@ func (c *Consumer) backfillUser(ctx context.Context, did string, lastRev string)
 		Rev:    commit.Rev,
 	}
 	if err := c.store.UpdateUser(tx, user); err != nil {
-		log.WithError(err).WithFields(lf).Error("failed to update user in database during backfill")
+		c.log.WithError(err).WithFields(lf).Error("failed to update user in database during backfill")
 		tx.Rollback()
 		return err
 	}
 	if err := tx.Commit().Error; err != nil {
-		log.WithError(err).WithFields(lf).Error("failed to commit transaction")
+		c.log.WithError(err).WithFields(lf).Error("failed to commit transaction")
 		return err
 	}
-	log.WithFields(log.Fields{
+	c.log.WithFields(log.Fields{
 		"did":   did,
 		"total": len(plays),
 	}).Info("backfilled user")

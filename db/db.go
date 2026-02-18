@@ -1,11 +1,13 @@
 package db
 
 import (
+	log "github.com/sirupsen/logrus"
 	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 )
 
 // {
@@ -47,6 +49,8 @@ type Play struct {
 	URI     string `gorm:"primaryKey"`
 	UserDid string
 
+	User	 User   `gorm:"foreignKey:UserDid"`
+
 	Artists                []Artist `gorm:"many2many:play_artists;"`
 	Duration               int
 	OriginUrl              string
@@ -68,6 +72,15 @@ func NewDB() (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.Logger = logger.New(
+		log.WithField("component", "gorm"),
+		logger.Config{
+			SlowThreshold:             200 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+			Colorful:                  false,
+		},
+	)
 	err = db.AutoMigrate(&User{}, &Play{}, &Artist{})
 	if err != nil {
 		return nil, err
@@ -87,6 +100,12 @@ func NewStore(db *gorm.DB) *Store {
 
 func (s *Store) Begin() *gorm.DB {
 	return s.DB.Begin()
+}
+
+func (s *Store) ListRecentPlays(limit int) ([]*Play, error) {
+	var plays []*Play
+	err := s.DB.Preload("Artists").Preload("User").Order("played_time desc").Limit(limit).Find(&plays).Error
+	return plays, err
 }
 
 func (s *Store) SavePlaysBatch(db *gorm.DB, plays []Play) error {
